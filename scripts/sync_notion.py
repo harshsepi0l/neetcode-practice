@@ -4,9 +4,11 @@
 NeetCode's GitHub Sync commits each submission as
     Data Structures & Algorithms/<neetcode-id>/submission-N.<ext>
 
-This script walks the git history from START_DATE on, takes the first commit
-date for each problem folder, matches the folder to a Problem Log row by the
-LeetCode slug in the row's Link, and sets Done on when it's still empty.
+This script walks the git history from START_DATE on and, for each problem
+folder, matches it to a Problem Log row by the slug in the row's Link, then:
+  - Done on:        first submission date, only when still empty (never moved)
+  - Last submitted: most recent submission date (kept current)
+  - Solution:       GitHub link to the most recent submission file (kept current)
 
 It never touches First try, Clue, Needs redo or any other field, never
 overwrites a Done on that's already set, and never creates rows. Folders it
@@ -29,6 +31,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.error
 import urllib.request
 
@@ -40,6 +43,8 @@ SLUG_RE = re.compile(r"(?:leetcode\.com|neetcode\.io)/problems/([^/?#]+)")
 PROP_TITLE = "Problem"
 PROP_LINK = "Link"
 PROP_DONE = "Done on"
+PROP_LAST = "Last submitted"
+PROP_SOLUTION = "Solution"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -54,8 +59,10 @@ def warn(msg):
 
 # ---------- git side ----------
 
-def first_submission_dates(repo, start_date, tz_name):
-    """Return {neetcode_id: 'YYYY-MM-DD'} with the earliest commit date on/after start_date."""
+def submissions(repo, start_date, tz_name):
+    """Return {neetcode_id: {"first", "last", "path"}} for commits on/after start_date.
+
+    first/last are 'YYYY-MM-DD' in tz_name; path is the newest submission file."""
     env = dict(os.environ, TZ=tz_name)
     out = subprocess.run(
         [
@@ -69,7 +76,7 @@ def first_submission_dates(repo, start_date, tz_name):
         env=env, check=True, capture_output=True, text=True,
     ).stdout
 
-    first = {}
+    subs = {}
     current = None
     for line in out.splitlines():
         if line.startswith("@@"):
@@ -82,9 +89,12 @@ def first_submission_dates(repo, start_date, tz_name):
         if current < start_date:
             continue
         pid = parts[1]
-        if pid not in first or current < first[pid]:
-            first[pid] = current
-    return first
+        s = subs.setdefault(pid, {"first": current, "last": current, "path": line})
+        # log is oldest-first, so later lines are newer
+        s["first"] = min(s["first"], current)
+        if current >= s["last"]:
+            s["last"], s["path"] = current, line
+    return subs
 
 
 # ---------- Notion side ----------
@@ -135,20 +145,36 @@ def load_rows(token, data_source_id):
             link = plain_text(props.get(PROP_LINK))
             m = SLUG_RE.search(link)
             done = (props.get(PROP_DONE) or {}).get("date")
+            last = (props.get(PROP_LAST) or {}).get("date")
             rows.append({
                 "id": page["id"],
                 "title": plain_text(props.get(PROP_TITLE)),
                 "slug": m.group(1).lower() if m else None,
                 "done": done.get("start") if done else None,
+                "last": last.get("start") if last else None,
+                "solution": plain_text(props.get(PROP_SOLUTION)) or None,
             })
         if not res.get("has_more"):
             return rows
         cursor = res["next_cursor"]
 
 
-def set_done_on(token, page_id, date):
-    notion("PATCH", f"/pages/{page_id}", token,
-           {"properties": {PROP_DONE: {"date": {"start": date}}}})
+def update_row(token, page_id, props):
+    notion("PATCH", f"/pages/{page_id}", token, {"properties": props})
+
+
+def solution_url(repo_slug, branch, path):
+    return f"https://github.com/{repo_slug}/blob/{branch}/" + urllib.parse.quote(path)
+
+
+def repo_slug_from_git(repo):
+    """owner/name from GITHUB_REPOSITORY (set in Actions) or the origin remote."""
+    if os.environ.get("GITHUB_REPOSITORY"):
+        return os.environ["GITHUB_REPOSITORY"]
+    url = subprocess.run(["git", "-C", repo, "remote", "get-url", "origin"],
+                         capture_output=True, text=True).stdout.strip()
+    m = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$", url)
+    return m.group(1) if m else None
 
 
 # ---------- matching ----------
@@ -159,22 +185,22 @@ def load_aliases(path):
     return {k.lower(): v.lower() for k, v in data.items() if not k.startswith("_")}
 
 
-def match(first_dates, rows, aliases):
-    """Return (matches, unmatched). matches: list of (neetcode_id, date, row)."""
+def match(subs, rows, aliases):
+    """Return (matches, unmatched). matches: list of (neetcode_id, sub, row)."""
     by_slug = {}
     for r in rows:
         if r["slug"]:
             by_slug.setdefault(r["slug"], r)
     matches, unmatched = [], []
-    for pid, date in sorted(first_dates.items(), key=lambda kv: kv[1]):
+    for pid, sub in sorted(subs.items(), key=lambda kv: kv[1]["first"]):
         # neetcode.io links use the folder name as-is; leetcode.com links may need an alias
         slug = aliases.get(pid.lower(), pid.lower())
         row = by_slug.get(pid.lower()) or by_slug.get(slug)
         if row:
-            matches.append((pid, date, row))
+            matches.append((pid, sub, row))
         else:
             guess = difflib.get_close_matches(slug, by_slug.keys(), n=1, cutoff=0.6)
-            unmatched.append((pid, date, guess[0] if guess else None))
+            unmatched.append((pid, sub["first"], guess[0] if guess else None))
     return matches, unmatched
 
 
@@ -191,9 +217,9 @@ def main():
     token = os.environ.get("NOTION_TOKEN", "")
     ds_id = os.environ.get("NOTION_DATA_SOURCE_ID", "")
 
-    first = first_submission_dates(args.repo, start, tz_name)
-    print(f"Problems with a submission on or after {start}: {len(first)}")
-    if not first:
+    subs = submissions(args.repo, start, tz_name)
+    print(f"Problems with a submission on or after {start}: {len(subs)}")
+    if not subs:
         return
 
     if args.rows_json:
@@ -205,17 +231,31 @@ def main():
         rows = load_rows(token, ds_id)
     print(f"Problem Log rows: {len(rows)}")
 
-    matches, unmatched = match(first, rows, load_aliases(args.aliases))
+    matches, unmatched = match(subs, rows, load_aliases(args.aliases))
+    repo_slug = repo_slug_from_git(args.repo)
+    branch = os.environ.get("GITHUB_REF_NAME", "main")
 
     updated = skipped = 0
-    for pid, date, row in matches:
-        if row["done"]:
+    for pid, sub, row in matches:
+        props, changes = {}, []
+        if not row["done"]:
+            props[PROP_DONE] = {"date": {"start": sub["first"]}}
+            changes.append(f"Done on {sub['first']}")
+        if row["last"] != sub["last"]:
+            props[PROP_LAST] = {"date": {"start": sub["last"]}}
+            changes.append(f"Last submitted {sub['last']}")
+        if repo_slug:
+            url = solution_url(repo_slug, branch, sub["path"])
+            if row["solution"] != url:
+                props[PROP_SOLUTION] = {"url": url}
+                changes.append(f"Solution {sub['path'].split('/')[-1]}")
+        if not props:
             skipped += 1
-            print(f"  keep   {row['title']}: Done on already {row['done']}")
+            print(f"  keep   {row['title']}: up to date")
             continue
-        print(f"  {'would set' if args.dry_run else 'set'}  {row['title']}: Done on {date}  (from {pid})")
+        print(f"  {'would set' if args.dry_run else 'set'}  {row['title']}: {', '.join(changes)}  (from {pid})")
         if not args.dry_run:
-            set_done_on(token, row["id"], date)
+            update_row(token, row["id"], props)
             time.sleep(0.35)  # stay under Notion's ~3 requests/second
         updated += 1
 
@@ -224,7 +264,7 @@ def main():
         warn(f"No Problem Log row for folder '{pid}' (first submitted {date}).{hint}")
 
     verb = "Would update" if args.dry_run else "Updated"
-    print(f"{verb} {updated}, left {skipped} that already had a date, {len(unmatched)} unmatched.")
+    print(f"{verb} {updated}, left {skipped} already up to date, {len(unmatched)} unmatched.")
 
 
 if __name__ == "__main__":
