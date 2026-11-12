@@ -9,9 +9,12 @@ folder, matches it to a Problem Log row by the slug in the row's Link, then:
   - Done on:        first submission date, only when still empty (never moved)
   - Last submitted: most recent submission date (kept current)
   - Solution:       GitHub link to the most recent submission file (kept current)
+  - Needs redo:     ticked when First try is "Solution", but only while there's
+                    no submission after Done on. Once you've resubmitted, it's
+                    yours to untick and the sync never re-ticks it.
 
-It never touches First try, Clue, Needs redo or any other field, never
-overwrites a Done on that's already set, and never creates rows. Folders it
+It never writes First try, Clue or any other field, never overwrites a Done on
+that's already set, never unticks Needs redo, and never creates rows. Folders it
 can't match are printed as warnings.
 
 Env vars:
@@ -45,6 +48,9 @@ PROP_LINK = "Link"
 PROP_DONE = "Done on"
 PROP_LAST = "Last submitted"
 PROP_SOLUTION = "Solution"
+PROP_FIRST_TRY = "First try"
+PROP_NEEDS_REDO = "Needs redo"
+FIRST_TRY_FAILED = "Solution"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -153,6 +159,8 @@ def load_rows(token, data_source_id):
                 "done": done.get("start") if done else None,
                 "last": last.get("start") if last else None,
                 "solution": plain_text(props.get(PROP_SOLUTION)) or None,
+                "first_try": ((props.get(PROP_FIRST_TRY) or {}).get("select") or {}).get("name"),
+                "needs_redo": bool((props.get(PROP_NEEDS_REDO) or {}).get("checkbox")),
             })
         if not res.get("has_more"):
             return rows
@@ -244,6 +252,11 @@ def main():
         if row["last"] != sub["last"]:
             props[PROP_LAST] = {"date": {"start": sub["last"]}}
             changes.append(f"Last submitted {sub['last']}")
+        done_on = row["done"] or sub["first"]
+        if (row.get("first_try") == FIRST_TRY_FAILED and not row.get("needs_redo")
+                and sub["last"] <= done_on):
+            props[PROP_NEEDS_REDO] = {"checkbox": True}
+            changes.append("Needs redo ticked")
         if repo_slug:
             url = solution_url(repo_slug, branch, sub["path"])
             if row["solution"] != url:
