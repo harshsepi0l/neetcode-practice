@@ -1,0 +1,49 @@
+name: Sync submissions to Notion
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Data Structures & Algorithms/**"
+  schedule:
+    # safety net in case a push run gets missed: 11:00 UTC daily (6 or 7 AM Detroit)
+    - cron: "0 11 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Only print what would change"
+        type: boolean
+        default: true
+
+concurrency:
+  group: notion-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # needs history to find each problem's first submission date
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Update Done on in the Problem Log
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATA_SOURCE_ID: ${{ secrets.NOTION_DATA_SOURCE_ID }}
+          START_DATE: "2026-11-12"
+          TZ_NAME: "America/Detroit"
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
+            python scripts/sync_notion.py --dry-run
+          else
+            python scripts/sync_notion.py
+          fi
