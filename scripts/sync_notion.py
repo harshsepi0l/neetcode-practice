@@ -35,7 +35,7 @@ import urllib.request
 NOTION_API = "https://api.notion.com/v1"
 NOTION_VERSION = "2025-09-03"
 DSA_DIR = "Data Structures & Algorithms"
-SLUG_RE = re.compile(r"leetcode\.com/problems/([^/?#]+)")
+SLUG_RE = re.compile(r"(?:leetcode\.com|neetcode\.io)/problems/([^/?#]+)")
 
 PROP_TITLE = "Problem"
 PROP_LINK = "Link"
@@ -167,8 +167,9 @@ def match(first_dates, rows, aliases):
             by_slug.setdefault(r["slug"], r)
     matches, unmatched = [], []
     for pid, date in sorted(first_dates.items(), key=lambda kv: kv[1]):
+        # neetcode.io links use the folder name as-is; leetcode.com links may need an alias
         slug = aliases.get(pid.lower(), pid.lower())
-        row = by_slug.get(slug)
+        row = by_slug.get(pid.lower()) or by_slug.get(slug)
         if row:
             matches.append((pid, date, row))
         else:
